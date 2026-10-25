@@ -1,0 +1,30 @@
+#!/bin/bash
+export PATH="$HOME/.local/bin:$PATH"
+
+CONFIG_FILE="$HOME/.config/cinetop/config.env"
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "❌ Missing config file at $CONFIG_FILE. Run ./install.sh first."
+    exit 1
+fi
+source "$CONFIG_FILE"
+
+INTERVAL="${1:-4}"
+CINECA_WORK_BASE="${CINECA_WORK_BASE:-/leonardo_work}"
+REMOTE_BIN="${CINECA_WORK_BASE}/${CINECA_ACCOUNT}/${CINECA_USER}/bin/cinetop"
+
+if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$CINECA_SSH_HOST" "true" 2>/dev/null; then
+    echo "=================================================================="
+    echo "🔑 CINECA SSH Certificate expired or tunnel closed."
+    echo "   Renewing certificate for $KEYCLOAK_EMAIL via step-cli..."
+    echo "=================================================================="
+    rm -f ~/.ssh/cm-* 2>/dev/null
+
+    step ssh certificate "$KEYCLOAK_EMAIL" ~/.ssh/cineca_key \
+        --provisioner cineca-hpc \
+        --no-password \
+        --insecure \
+        --no-agent \
+        --force || exit 1
+fi
+
+exec ssh -t "$CINECA_SSH_HOST" "$REMOTE_BIN $INTERVAL"

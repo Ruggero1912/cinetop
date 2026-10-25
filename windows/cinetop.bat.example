@@ -1,0 +1,4 @@
+@echo off
+title CINECA Leonardo GPU Monitor (cinetop)
+ssh -t user@your-lab-server.it "~/.local/bin/cinetop 4"
+pause

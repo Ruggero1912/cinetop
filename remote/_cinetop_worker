@@ -1,0 +1,128 @@
+#!/bin/bash
+
+C_RESET="\033[0m"
+C_BOLD="\033[1m"
+C_CYAN="\033[1;36m"
+C_GREEN="\033[1;32m"
+C_YELLOW="\033[1;33m"
+C_RED="\033[1;31m"
+C_MAGENTA="\033[1;35m"
+C_GRAY="\033[0;37m"
+
+# Load user config if deployed by install.sh, else auto-detect from active jobs or saldo
+[ -f "$HOME/.cineca_kit_rc" ] && source "$HOME/.cineca_kit_rc"
+ACCOUNT="${CINECA_ACCOUNT:-$(squeue -u "$USER" -h -o "%a" | head -n 1)}"
+
+# 1. PROJECT HOURS BUDGET (Cached for 10m)
+SALDO_CACHE="/tmp/cinetop_saldo_${USER}_${ACCOUNT}"
+if [ ! -f "$SALDO_CACHE" ] || [ $(( $(date +%s) - $(stat -c %Y "$SALDO_CACHE" 2>/dev/null || echo 0) )) -gt 600 ]; then
+    if [ -n "$ACCOUNT" ]; then
+        saldo -b 2>/dev/null | awk -v acc="$ACCOUNT" 'tolower($1) == tolower(acc) {printf "%s / %s h (%.1f%%)", $6, $4, ($6/$4)*100}' > "$SALDO_CACHE"
+    else
+        saldo -b 2>/dev/null | awk 'NR>3 && $4>0 {printf "%s: %s/%sh (%.1f%%)", $1, $6, $4, ($6/$4)*100; exit}' > "$SALDO_CACHE"
+    fi
+fi
+BUDGET_STR=$(cat "$SALDO_CACHE" 2>/dev/null)
+[ -z "$BUDGET_STR" ] && BUDGET_STR="N/A"
+
+# 2. LEONARDO CLUSTER LOAD (boost_usr_prod)
+SINFO_NODES=$(sinfo -p "${CINECA_PARTITION:-boost_usr_prod}" -h -o "%F" 2>/dev/null | head -n 1)
+if [ -n "$SINFO_NODES" ]; then
+    IFS='/' read -r n_alloc n_idle n_other n_tot <<< "$SINFO_NODES"
+    n_avail=$(( n_tot - n_other ))
+    load_pct=$(( n_avail > 0 ? (n_alloc * 100) / n_avail : 0 ))
+    filled=$(( (load_pct * 15) / 100 ))
+    empty=$(( 15 - filled ))
+    bar=$(printf "%${filled}s" | tr ' ' '#')$(printf "%${empty}s" | tr ' ' '-')
+
+    if [ "$load_pct" -ge 90 ]; then c_load="$C_RED"
+    elif [ "$load_pct" -ge 70 ]; then c_load="$C_YELLOW"
+    else c_load="$C_GREEN"; fi
+
+    CLUSTER_STR=$(printf "${c_load}[%s] %d%%${C_RESET} (%d/%d active GPU nodes, %d idle)" "$bar" "$load_pct" "$n_alloc" "$n_avail" "$n_idle")
+else
+    CLUSTER_STR="N/A"
+fi
+
+# 3. HEADER
+running_count=$(squeue -u "$USER" -t R -h | wc -l)
+pending_count=$(squeue -u "$USER" -t PD -h | wc -l)
+
+printf "${C_BOLD}CINECA HPC GPU Monitor${C_RESET} | User: ${C_CYAN}%s${C_RESET} | Running: ${C_GREEN}%d${C_RESET} | Pending: ${C_YELLOW}%d${C_RESET} | Grant ${C_MAGENTA}%s${C_RESET}: ${C_BOLD}%s${C_RESET}\n" \
+    "$USER" "$running_count" "$pending_count" "${ACCOUNT:-auto}" "$BUDGET_STR"
+printf "${C_BOLD}Partition Load (${CINECA_PARTITION:-boost_usr_prod}):${C_RESET}    %b\n" "$CLUSTER_STR"
+printf "${C_GRAY}=====================================================================================================================${C_RESET}\n"
+printf "${C_CYAN}%-10s | %-42s | %-8s | %-10s | %-6s | %-18s | %-5s${C_RESET}\n" "JOBID" "EXPERIMENT NAME" "NODE" "ELAPSED" "GPU %" "VRAM (USED/TOT)" "TEMP"
+printf "${C_GRAY}---------------------------------------------------------------------------------------------------------------------${C_RESET}\n"
+
+to_seconds() {
+    local t="$1" d=0 h=0 m=0 s=0
+    if [[ "$t" == *-* ]]; then d=${t%%-*}; t=${t#*-}; fi
+    IFS=':' read -r p1 p2 p3 <<< "$t"
+    if [ -n "$p3" ]; then h=$p1; m=$p2; s=$p3
+    elif [ -n "$p2" ]; then m=$p1; s=$p2
+    else s=$p1; fi
+    echo $(( 10#$d * 86400 + 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+}
+
+# 4. RUNNING JOBS (Sorted by ELAPSED descending)
+TMP_DIR=$(mktemp -d /tmp/cinetop.XXXXXX)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+for line in $(squeue -u "$USER" -t R -h -o "%i|%j|%N|%M"); do
+    (
+        IFS='|' read -r jid jname node elapsed <<< "$line"
+        el_sec=$(to_seconds "$elapsed")
+        raw=$(srun --jobid="$jid" --overlap bash -c "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits" 2>/dev/null | head -n 1)
+
+        if [ -n "$raw" ]; then
+            IFS=',' read -r util mem_used mem_tot temp <<< "$raw"
+            util=$(echo "$util" | xargs); mem_used=$(echo "$mem_used" | xargs)
+            mem_tot=$(echo "$mem_tot" | xargs); temp=$(echo "$temp" | xargs)
+
+            if [ "${util:-0}" -ge 50 ] 2>/dev/null; then c_util="$C_GREEN"
+            elif [ "${util:-0}" -gt 0 ] 2>/dev/null; then c_util="$C_YELLOW"
+            else c_util="$C_RED"; fi
+
+            if [ "${temp:-0}" -ge 75 ] 2>/dev/null; then c_temp="$C_RED"
+            elif [ "${temp:-0}" -ge 65 ] 2>/dev/null; then c_temp="$C_YELLOW"
+            else c_temp="$C_GREEN"; fi
+
+            vram_str=$(printf "%5s / %5s MiB" "$mem_used" "$mem_tot")
+            row=$(printf "%-10s | %-42s | %-8s | %-10s | ${c_util}%4s%%${C_RESET}  | %-18s | ${c_temp}%3s°C${C_RESET}" \
+                "$jid" "${jname:0:42}" "$node" "$elapsed" "$util" "$vram_str" "$temp")
+        else
+            row=$(printf "%-10s | %-42s | %-8s | %-10s | ${C_YELLOW}%-6s${C_RESET} | %-18s | %-5s" \
+                "$jid" "${jname:0:42}" "$node" "$elapsed" "init.." "---" "---")
+        fi
+        printf "%010d|%s\n" "$el_sec" "$row" > "$TMP_DIR/$jid"
+    ) &
+done
+wait
+
+if [ "$running_count" -gt 0 ]; then
+    cat "$TMP_DIR"/* 2>/dev/null | sort -t'|' -k1,1nr | cut -d'|' -f2-
+else
+    printf "${C_YELLOW}No RUNNING jobs at the moment.${C_RESET}\n"
+fi
+
+# 5. PENDING JOBS
+if [ "$pending_count" -gt 0 ]; then
+    printf "${C_GRAY}---------------------------------------------------------------------------------------------------------------------${C_RESET}\n"
+    printf "${C_YELLOW}Pending Jobs in Queue:${C_RESET}\n"
+    squeue -u "$USER" -t PD -h -o "  • %i | %j (Reason: %r)" | head -n 6
+fi
+
+# 6. LAST 5 COMPLETED/FAILED JOBS
+printf "${C_GRAY}---------------------------------------------------------------------------------------------------------------------${C_RESET}\n"
+printf "${C_BOLD}Last 5 Finished Jobs (past 3 days):${C_RESET}\n"
+sacct -u "$USER" -X -n -S $(date -d "3 days ago" +%Y-%m-%d) -o JobID%-10,JobName%-42,State%-12,Elapsed%-10,End%-19 2>/dev/null \
+    | grep -E "COMPLETED|FAILED|TIMEOUT|CANCELLED" \
+    | sort -k5,5r \
+    | head -n 5 \
+    | while read -r jid jname state elapsed end_time; do
+        if [[ "$state" == "COMPLETED" ]]; then c_st="$C_GREEN"
+        elif [[ "$state" == "FAILED" || "$state" == "TIMEOUT" ]]; then c_st="$C_RED"
+        else c_st="$C_YELLOW"; fi
+        printf "  %-10s | %-42s | ${c_st}%-10s${C_RESET} | Elapsed: %-10s | End: %s\n" "$jid" "$jname" "$state" "$elapsed" "$end_time"
+    done
